@@ -53,6 +53,9 @@ function startBotAI(io, roomCode, room, gameText) {
 }
 
 export function setupSocketHandlers(io, rooms) {
+    // Store pending disconnects for grace period
+    const pendingDisconnects = new Map();
+    const DISCONNECT_GRACE_PERIOD = 5000; // 5 seconds to reconnect
 
     io.on('connection', (socket) => {
         console.log(`✅ User connected: ${socket.id}`);
@@ -127,6 +130,99 @@ export function setupSocketHandlers(io, rooms) {
             });
 
             console.log(`👤 ${username} joined room ${roomCode}`);
+        });
+
+        // REJOIN ROOM (for refresh/reconnect)
+        socket.on('rejoin_room', ({ username, roomCode }) => {
+            console.log(`🔄 Rejoin request from ${username} for room ${roomCode}`);
+            const room = rooms.get(roomCode);
+
+            if (!room) {
+                console.log(`❌ Room ${roomCode} not found`);
+                socket.emit('rejoin_failed', {
+                    message: 'Room no longer exists. Please create or join a new room.'
+                });
+                return;
+            }
+
+            console.log(`📋 Room ${roomCode} has ${room.players.length} players:`, room.players.map(p => p.name));
+
+            // Cancel pending disconnect if exists
+            const pendingKey = `${roomCode}:${username}`;
+            if (pendingDisconnects.has(pendingKey)) {
+                clearTimeout(pendingDisconnects.get(pendingKey));
+                pendingDisconnects.delete(pendingKey);
+                console.log(`⏳ Cancelled pending disconnect for ${username}`);
+            }
+
+            // Check if player already exists in room (by username)
+            const existingPlayer = room.players.find(p => p.name === username && !p.isBot);
+
+            if (existingPlayer) {
+                // Update the socket ID for the existing player
+                const oldSocketId = existingPlayer.id;
+                existingPlayer.id = socket.id;
+
+                // Update masterId if this player was the master
+                if (room.masterId === oldSocketId) {
+                    room.masterId = socket.id;
+                }
+
+                socket.join(roomCode);
+
+                const payload = {
+                    roomCode,
+                    isRoomMaster: room.masterId === socket.id,
+                    players: room.players,
+                    language: room.language,
+                    maxPlayers: room.maxPlayers
+                };
+
+                console.log(`📤 Sending room_joined to ${username}:`, payload);
+
+                // Send room info back to the rejoining player
+                socket.emit('room_joined', payload);
+
+                console.log(`🔄 ${username} rejoined room ${roomCode} (isRoomMaster: ${room.masterId === socket.id})`);
+            } else {
+                // Player doesn't exist, treat as new join if room has space
+                if (room.players.length >= room.maxPlayers) {
+                    socket.emit('rejoin_failed', { message: 'Room is full' });
+                    return;
+                }
+
+                if (room.started) {
+                    socket.emit('rejoin_failed', { message: 'Game already started' });
+                    return;
+                }
+
+                const newPlayer = {
+                    id: socket.id,
+                    name: username,
+                    progress: 0,
+                    finished: false
+                };
+
+                room.players.push(newPlayer);
+                socket.join(roomCode);
+
+                // Notify all players
+                io.to(roomCode).emit('player_joined', {
+                    players: room.players,
+                    newPlayer: username
+                });
+
+                // Send room info
+                socket.emit('room_joined', {
+                    roomCode,
+                    isRoomMaster: false,
+                    players: room.players,
+                    language: room.language,
+                    maxPlayers: room.maxPlayers
+                });
+
+                console.log(`👤 ${username} joined room ${roomCode} (via rejoin)`);
+            }
         });
 
         // CHANGE LANGUAGE (only room master)
@@ -225,6 +321,14 @@ export function setupSocketHandlers(io, rooms) {
 
                 if (playerIndex !== -1) {
                     const playerName = room.players[playerIndex].name;
+
+                    // Clear any pending disconnect for this player
+                    const pendingKey = `${roomCode}:${playerName}`;
+                    if (pendingDisconnects.has(pendingKey)) {
+                        clearTimeout(pendingDisconnects.get(pendingKey));
+                        pendingDisconnects.delete(pendingKey);
+                    }
+
                     room.players.splice(playerIndex, 1);
                     socket.leave(roomCode);
 
@@ -361,37 +465,72 @@ export function setupSocketHandlers(io, rooms) {
         socket.on('disconnect', () => {
             console.log(`❌ User disconnected: ${socket.id}`);
 
-            // Remove player from all rooms
+            // Find which room this player was in
             rooms.forEach((room, roomCode) => {
                 const playerIndex = room.players.findIndex(p => p.id === socket.id);
 
                 if (playerIndex !== -1) {
-                    const playerName = room.players[playerIndex].name;
-                    room.players.splice(playerIndex, 1);
+                    const player = room.players[playerIndex];
+                    const playerName = player.name;
+                    const isBot = player.isBot;
 
-                    // If room is empty, delete it
-                    if (room.players.length === 0) {
-                        rooms.delete(roomCode);
-                        console.log(`🗑️ Room ${roomCode} deleted (empty)`);
-                    } else {
-                        // Assign new master if needed
-                        if (room.masterId === socket.id) {
-                            // Find first human player
-                            const humanPlayer = room.players.find(p => !p.isBot);
-                            if (humanPlayer) {
-                                room.masterId = humanPlayer.id;
-                                io.to(roomCode).emit('new_master_assigned', {
-                                    newMasterId: humanPlayer.id,
-                                    newMasterName: humanPlayer.name
-                                });
-                            }
-                        }
-
+                    // Bots are removed immediately
+                    if (isBot) {
+                        room.players.splice(playerIndex, 1);
                         io.to(roomCode).emit('player_left', {
                             playerName,
                             players: room.players
                         });
+                        return;
                     }
+
+                    // For human players, use grace period for potential reconnect
+                    const pendingKey = `${roomCode}:${playerName}`;
+                    console.log(`⏳ Starting grace period for ${playerName} in room ${roomCode}`);
+
+                    const timeoutId = setTimeout(() => {
+                        // Re-check if player still has the old socket ID (not reconnected)
+                        const currentRoom = rooms.get(roomCode);
+                        if (!currentRoom) return;
+
+                        const currentPlayerIndex = currentRoom.players.findIndex(
+                            p => p.name === playerName && p.id === socket.id
+                        );
+
+                        if (currentPlayerIndex !== -1) {
+                            // Player didn't reconnect, remove them
+                            currentRoom.players.splice(currentPlayerIndex, 1);
+                            console.log(`👋 ${playerName} removed from room ${roomCode} after grace period`);
+
+                            // If room is empty (only bots left or no players), delete it
+                            const humanPlayers = currentRoom.players.filter(p => !p.isBot);
+                            if (humanPlayers.length === 0) {
+                                rooms.delete(roomCode);
+                                console.log(`🗑️ Room ${roomCode} deleted (no human players)`);
+                            } else {
+                                // Assign new master if needed
+                                if (currentRoom.masterId === socket.id) {
+                                    const humanPlayer = currentRoom.players.find(p => !p.isBot);
+                                    if (humanPlayer) {
+                                        currentRoom.masterId = humanPlayer.id;
+                                        io.to(roomCode).emit('new_master_assigned', {
+                                            newMasterId: humanPlayer.id,
+                                            newMasterName: humanPlayer.name
+                                        });
+                                    }
+                                }
+
+                                io.to(roomCode).emit('player_left', {
+                                    playerName,
+                                    players: currentRoom.players
+                                });
+                            }
+                        }
+
+                        pendingDisconnects.delete(pendingKey);
+                    }, DISCONNECT_GRACE_PERIOD);
+
+                    pendingDisconnects.set(pendingKey, timeoutId);
                 }
             });
         });
