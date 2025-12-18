@@ -5,7 +5,9 @@ import cors from 'cors';
 import dotenv from 'dotenv';
 import { setupSocketHandlers } from './socket/socketHandler.js';
 
-dotenv.config();
+if (process.env.NODE_ENV !== "production") {
+    dotenv.config();
+}
 
 const app = express();
 const httpServer = createServer(app);
